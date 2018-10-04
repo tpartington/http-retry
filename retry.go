@@ -12,15 +12,22 @@ import (
 	"time"
 )
 
+var verbose bool
+
 type retry interface {
 	post(req *http.Request, client http.Client) (response *http.Response, err error)
 }
 
-type retryingClient struct {
-	MaxAttempts int
+type httpClient interface {
+	Do(req *http.Request) (*http.Response, error)
 }
 
-func newHTTPClient() http.Client {
+type retryingClient struct {
+	maxAttempts int
+	client      httpClient
+}
+
+func newHTTPClient() *http.Client {
 	netTransport := &http.Transport{
 		Dial: (&net.Dialer{
 			Timeout: 1 * time.Second,
@@ -33,7 +40,7 @@ func newHTTPClient() http.Client {
 		Transport: netTransport,
 	}
 
-	return *client
+	return client
 }
 
 func newHTTPPost(url string, data []byte) *http.Request {
@@ -49,31 +56,33 @@ func newHTTPPost(url string, data []byte) *http.Request {
 	return req
 }
 
-func (rc retryingClient) post(client http.Client, url string, data []byte) (response *http.Response, err error) {
-	attempt := 0
+func (rc retryingClient) post(url string, data []byte) (response *http.Response, err error) {
+	attempt := 1
 
 	// keep trying until we return a success or we run out of attempts
-	for attempt < rc.MaxAttempts {
+	for attempt <= rc.maxAttempts {
 		req := newHTTPPost(url, data)
 
-		if attempt != 0 {
+		if attempt != 1 {
 			backoff(attempt)
 		}
 
-		response, err = client.Do(req)
+		response, err = rc.client.Do(req)
 
 		if err == nil {
-			log.Printf("server responded with status: %v\n", response.Status)
+			if verbose {
+				log.Printf("server responded with status: %v\n", response.Status)
+			}
 
+			// no connection error and successful response code, don't retry
 			if response.StatusCode >= 200 && response.StatusCode < 299 {
-				// no connection error and successful response code, don't retry
 				return response, nil
 			}
 
+			// no connection error but a client request error, don't retry
 			if response.StatusCode >= 400 && response.StatusCode < 499 {
-				// no connection error but a client request error, don't retry
 				err = fmt.Errorf("client error %d, not retrying", response.StatusCode)
-				return nil, err
+				return response, err
 			}
 		}
 
@@ -84,34 +93,40 @@ func (rc retryingClient) post(client http.Client, url string, data []byte) (resp
 		attempt++
 	}
 
-	err = fmt.Errorf("MaxAttempts %v reached, last attempt failed with: %v", rc.MaxAttempts, err)
-	return nil, err
+	err = fmt.Errorf("maxAttempts %v reached, last attempt failed with: %v", rc.maxAttempts, err)
+	return response, err
 
 }
 
 func backoff(attempt int) {
-	exponential := math.Pow(2, float64(attempt))
-	sleep := time.Duration(exponential) * 100000000
+	// x^4 gives us the nicest backoff rate
+	exponential := math.Pow(float64(attempt), 4)
+	sleep := time.Duration(exponential) * time.Millisecond
 	jitter := time.Duration(rand.Int63n(int64(sleep)))
 	sleep = sleep + jitter/2
-	log.Printf("attempt=%d back-off=%s", attempt, sleep)
+	if verbose {
+		log.Printf("attempt=%d back-off=%s", attempt, sleep)
+	}
 	time.Sleep(sleep)
 }
 
 func post() error {
-	client := newHTTPClient()
-	rc := retryingClient{}
-	rc.MaxAttempts = 5
-	url := "http://localhost:5512/"
+	rc := &retryingClient{}
+	rc.client = newHTTPClient()
+	rc.maxAttempts = 3
+	url := "http://localhost:8000/random"
 	data := []byte(`{"key":"value"}`)
 
-	resp, err := rc.post(client, url, data)
+	resp, err := rc.post(url, data)
 	if err != nil {
 		log.Printf("Unable to post message: %v", err)
 		return err
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
+	}
 	fmt.Printf("post: %d %s\n", resp.StatusCode, (string(body)))
 	defer resp.Body.Close()
 
